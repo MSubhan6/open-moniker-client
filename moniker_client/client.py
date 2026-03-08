@@ -14,6 +14,7 @@ from .auth import get_auth_headers
 from .config import ClientConfig
 from .adapters import get_adapter
 from .resilience import RetryConfig, retry_with_backoff, ClientCircuitBreaker
+from .pandas_utils import to_pandas_smart, _pandas_available
 
 
 class MonikerError(Exception):
@@ -53,14 +54,38 @@ class FetchResult:
     truncated: bool = False
     query_executed: str | None = None
     execution_time_ms: float | None = None
+    semantic_tags: list[str] = field(default_factory=list)
+    schema: dict[str, Any] | None = None
 
     def to_dataframe(self):
-        """Convert result to pandas DataFrame."""
+        """
+        Convert result to pandas DataFrame.
+
+        Always returns a DataFrame regardless of data structure.
+        For backward compatibility.
+        """
         try:
             import pandas as pd
             return pd.DataFrame(self.data)
         except ImportError:
             raise ImportError("pandas is required for to_dataframe(). Install with: pip install pandas")
+
+    def to_pandas(self):
+        """
+        Convert to the most appropriate pandas object.
+
+        Uses smart detection based on semantic tags, schema, and data shape.
+        Returns:
+        - Scalar value for single-value datasets
+        - pd.Series for single-column datasets
+        - pd.Series with DatetimeIndex for timeseries
+        - pd.DataFrame for multi-column datasets
+        """
+        return to_pandas_smart(
+            self.data,
+            schema=self.schema,
+            semantic_tags=self.semantic_tags,
+        )
 
     @property
     def df(self):
@@ -416,7 +441,13 @@ class MonikerClient:
             **kwargs: Additional parameters passed to the source adapter
 
         Returns:
-            The data from the source
+            If smart_pandas=True (default with pandas installed):
+                - Scalar value for single-value datasets
+                - pd.Series for single-column datasets
+                - pd.Series with DatetimeIndex for timeseries
+                - pd.DataFrame for multi-column datasets
+            If smart_pandas=False:
+                - Raw data from the source adapter
         """
         start = time.perf_counter()
         outcome = "success"
@@ -445,6 +476,22 @@ class MonikerClient:
 
             if isinstance(data, (list, dict)):
                 row_count = len(data)
+
+            # Apply smart conversion if enabled and data is list of dicts
+            if self.config.smart_pandas and isinstance(data, list) and _pandas_available():
+                # Fetch metadata for smart conversion
+                semantic_tags = []
+                schema = None
+                try:
+                    meta = self.metadata(moniker)
+                    semantic_tags = meta.semantic_tags
+                    schema = meta.schema
+                except Exception:
+                    # If metadata fetch fails, continue without it
+                    pass
+
+                # Convert to appropriate pandas object
+                return to_pandas_smart(data, schema=schema, semantic_tags=semantic_tags)
 
             return data
 
@@ -663,9 +710,7 @@ class MonikerClient:
         Fetch data via server-side query execution.
 
         Unlike read(), this executes the query on the server and returns
-        a pandas DataFrame directly. Useful when:
-        - Client doesn't have direct source access
-        - You want server-side query optimization
+        data in the most appropriate format based on structure (if smart_pandas enabled).
 
         Args:
             moniker: Moniker path (with or without scheme)
@@ -673,7 +718,13 @@ class MonikerClient:
             **params: Additional query parameters
 
         Returns:
-            pandas DataFrame with the fetched data
+            If smart_pandas=True (default):
+                - Scalar value for single-value datasets
+                - pd.Series for single-column datasets
+                - pd.Series with DatetimeIndex for timeseries
+                - pd.DataFrame for multi-column datasets
+            If smart_pandas=False:
+                - FetchResult object (use .to_dataframe() or .to_pandas())
         """
         if not moniker.startswith("moniker://"):
             moniker = f"moniker://{moniker}"
@@ -686,6 +737,7 @@ class MonikerClient:
             query_params["limit"] = limit
         query_params.update(params)
 
+        # Fetch data
         with httpx.Client(timeout=self.config.timeout) as client:
             response = client.get(
                 f"{self.config.service_url}/fetch/{path}",
@@ -700,14 +752,42 @@ class MonikerClient:
                 raise AccessDeniedError(data.get("detail", "Access denied"))
             response.raise_for_status()
 
-            data = response.json()
+            fetch_data = response.json()
 
-        # Return DataFrame directly for simplicity
-        try:
-            import pandas as pd
-            return pd.DataFrame(data["data"])
-        except ImportError:
-            raise ImportError("pandas is required for fetch(). Install with: pip install pandas")
+        # Fetch metadata for smart conversion
+        semantic_tags = []
+        schema = None
+        if self.config.smart_pandas:
+            try:
+                # Get metadata for semantic tags and schema
+                meta = self.metadata(moniker)
+                semantic_tags = meta.semantic_tags
+                schema = meta.schema
+            except Exception:
+                # If metadata fetch fails, continue without it
+                pass
+
+        # Create FetchResult
+        result = FetchResult(
+            moniker=fetch_data.get("moniker", moniker),
+            path=fetch_data.get("path", path),
+            source_type=fetch_data.get("source_type", "unknown"),
+            row_count=fetch_data.get("row_count", len(fetch_data.get("data", []))),
+            columns=fetch_data.get("columns", []),
+            data=fetch_data.get("data", []),
+            truncated=fetch_data.get("truncated", False),
+            query_executed=fetch_data.get("query_executed"),
+            execution_time_ms=fetch_data.get("execution_time_ms"),
+            semantic_tags=semantic_tags,
+            schema=schema,
+        )
+
+        # Return smart-converted result if enabled
+        if self.config.smart_pandas and _pandas_available():
+            return result.to_pandas()
+
+        # Otherwise return FetchResult object
+        return result
 
     def metadata(self, moniker: str) -> MetadataResult:
         """
@@ -1103,15 +1183,29 @@ def lineage(moniker: str) -> dict[str, Any]:
     return _get_client().lineage(moniker)
 
 
-def fetch(moniker: str, limit: int | None = None, **params) -> FetchResult:
+def fetch(moniker: str, limit: int | None = None, **params):
     """
     Fetch data via server-side query execution.
 
+    By default (smart_pandas=True), returns the most appropriate pandas object:
+    - Scalar value for single-value datasets
+    - pd.Series for single-column datasets
+    - pd.Series with DatetimeIndex for timeseries
+    - pd.DataFrame for multi-column datasets
+
     Usage:
         from moniker_client import fetch
-        result = fetch("risk.cvar/DESK_A/20240115/ALL", limit=100)
-        print(result.data)  # List of rows
-        print(result.columns)  # Column names
+
+        # Smart conversion (default)
+        value = fetch("constants/pi")  # Returns: 3.14159
+        series = fetch("prices/AAPL")  # Returns: pd.Series
+        df = fetch("portfolio/holdings")  # Returns: pd.DataFrame
+
+        # Disable smart conversion
+        from moniker_client import MonikerClient, ClientConfig
+        client = MonikerClient(config=ClientConfig(smart_pandas=False))
+        result = client.fetch("data/path")  # Returns: FetchResult
+        df = result.to_dataframe()  # Explicit conversion
     """
     return _get_client().fetch(moniker, limit=limit, **params)
 

@@ -7,6 +7,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+
+def _pandas_available() -> bool:
+    """Check if pandas is installed."""
+    try:
+        import pandas
+        return True
+    except ImportError:
+        return False
+
 # Config file search paths (in order of precedence, last wins)
 CONFIG_SEARCH_PATHS = [
     Path.home() / ".moniker" / "client.yaml",  # User-level defaults
@@ -102,6 +111,13 @@ class ClientConfig:
     # Additional credentials as dict
     credentials: dict[str, Any] = field(default_factory=dict)
 
+    # Smart pandas conversion (auto-detect if pandas available)
+    smart_pandas: bool = field(
+        default_factory=lambda: (
+            os.environ.get("MONIKER_SMART_PANDAS", str(_pandas_available()).lower()).lower() == "true"
+        )
+    )
+
     # Deprecation awareness (feature toggle)
     deprecation_enabled: bool = field(
         default_factory=lambda: os.environ.get("MONIKER_DEPRECATION_ENABLED", "false").lower() == "true"
@@ -169,6 +185,7 @@ class ClientConfig:
             credentials=data.get("credentials", {}),
             retry_max_attempts=int(data.get("retry_max_attempts", os.environ.get("MONIKER_RETRY_MAX_ATTEMPTS", "3"))),
             retry_backoff_factor=float(data.get("retry_backoff_factor", os.environ.get("MONIKER_RETRY_BACKOFF_FACTOR", "0.5"))),
+            smart_pandas=data.get("smart_pandas", os.environ.get("MONIKER_SMART_PANDAS", str(_pandas_available()).lower()).lower() == "true"),
         )
 
     @classmethod

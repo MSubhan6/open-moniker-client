@@ -60,11 +60,11 @@ class TestMonikerClientFetch:
     """Test client fetch() endpoint (server-side execution)."""
 
     def test_fetch_returns_fetch_result(self):
-        """Test fetch returns FetchResult with data."""
+        """Test fetch returns FetchResult with data (smart_pandas=False)."""
         mock_svc = create_mock_service_for_integration()
 
         with mock_svc.patch_httpx():
-            client = MonikerClient(config=ClientConfig(service_url="http://mock"))
+            client = MonikerClient(config=ClientConfig(service_url="http://mock", smart_pandas=False))
             result = client.fetch("test/data")
 
         assert isinstance(result, FetchResult)
@@ -351,7 +351,7 @@ class TestMonikerFluentAPI:
         mock_svc = create_mock_service_for_integration()
 
         with mock_svc.patch_httpx():
-            client = MonikerClient(config=ClientConfig(service_url="http://mock"))
+            client = MonikerClient(config=ClientConfig(service_url="http://mock", smart_pandas=False))
             m = Moniker("test/data", client=client)
             result = m.fetch()
 
